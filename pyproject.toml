@@ -11,4 +11,6 @@ dependencies = [
 ]
 
 [tool.uv]
-dev-dependencies = []
+dev-dependencies = [
+    "jupytext>=1.18.1",
+]
