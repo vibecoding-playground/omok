@@ -1,0 +1,14 @@
+[project]
+name = "omok"
+version = "0.1.0"
+description = "AlphaZero-style Omok (Gomoku) AI with CLI interface"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "tqdm",
+]
+
+[tool.uv]
+dev-dependencies = []

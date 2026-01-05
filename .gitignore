@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Model checkpoints
+checkpoints/
+
+# uv
+uv.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
