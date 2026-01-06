@@ -1,12 +1,27 @@
 #%% [markdown]
-# # Omok (오목) AI - Colab Training
+# # Omok (오목) AI - Colab Training (GPU)
 #
 # AlphaZero 스타일 강화학습으로 9x9 오목 AI를 학습합니다.
 #
+# **특징:**
+# - Google Drive에 체크포인트 자동 저장
+# - 세션 종료 후에도 이어서 학습 가능
+#
 # **사용법:**
-# 1. 런타임 > 런타임 유형 변경 > GPU 선택
-# 2. 모든 셀 실행
-# 3. 학습 완료 후 모델 다운로드
+# 1. 런타임 > 런타임 유형 변경 > **GPU** 선택
+# 2. 모든 셀 실행 (기존 체크포인트가 있으면 자동으로 이어서 학습)
+
+#%% [markdown]
+# ## 0. Google Drive 마운트
+
+#%%
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+SAVE_DIR = '/content/drive/MyDrive/omok'
+os.makedirs(SAVE_DIR, exist_ok=True)
+print(f"Save directory: {SAVE_DIR}")
 
 #%%
 # Setup
@@ -15,6 +30,7 @@ subprocess.run(["pip", "install", "-q", "torch", "numpy", "tqdm", "matplotlib"])
 
 #%%
 import math
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -428,6 +444,14 @@ class ReplayBuffer:
             np.array([self.values[i] for i in indices]),
         )
 
+    def get_all(self) -> Tuple[List, List, List]:
+        return self.states, self.policies, self.values
+
+    def load(self, states, policies, values):
+        self.states = list(states)
+        self.policies = list(policies)
+        self.values = list(values)
+
     def __len__(self) -> int:
         return len(self.states)
 
@@ -439,7 +463,7 @@ print("Self-play system ready")
 
 #%%
 # Training hyperparameters - GPU 최적화
-NUM_ITERATIONS = 30          # 학습 반복 횟수
+NUM_ITERATIONS = 50          # 학습 반복 횟수
 GAMES_PER_ITERATION = 50     # 이터레이션당 자가대국 수
 MCTS_SIMULATIONS = 200       # MCTS 시뮬레이션 횟수
 BATCH_SIZE = 128             # 배치 사이즈 (GPU 메모리 활용)
@@ -447,14 +471,75 @@ EPOCHS_PER_ITERATION = 5     # 이터레이션당 학습 에폭
 LEARNING_RATE = 1e-3
 MAX_BUFFER_SIZE = 50000
 
+# Checkpoint paths
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint.pt")
+BUFFER_PATH = os.path.join(SAVE_DIR, "replay_buffer.pkl")
+HISTORY_PATH = os.path.join(SAVE_DIR, "history.pkl")
+
 print(f"Training config:")
 print(f"  Iterations: {NUM_ITERATIONS}")
 print(f"  Games/iter: {GAMES_PER_ITERATION}")
 print(f"  MCTS sims: {MCTS_SIMULATIONS}")
 print(f"  Batch size: {BATCH_SIZE}")
+print(f"  Checkpoint: {CHECKPOINT_PATH}")
 
 #%% [markdown]
-# ## 6. Train!
+# ## 6. Checkpoint Functions
+
+#%%
+def save_checkpoint(model, optimizer, scheduler, iteration, history, buffer):
+    """Save training state to Google Drive."""
+    # Save model & optimizer
+    torch.save({
+        "iteration": iteration,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+    }, CHECKPOINT_PATH)
+
+    # Save replay buffer
+    states, policies, values = buffer.get_all()
+    with open(BUFFER_PATH, "wb") as f:
+        pickle.dump({"states": states, "policies": policies, "values": values}, f)
+
+    # Save history
+    with open(HISTORY_PATH, "wb") as f:
+        pickle.dump(history, f)
+
+    print(f"  💾 Checkpoint saved (iteration {iteration})")
+
+
+def load_checkpoint(model, optimizer, scheduler, buffer):
+    """Load training state from Google Drive if exists."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        print("No checkpoint found. Starting fresh.")
+        return 0, {"policy_loss": [], "value_loss": [], "game_length": []}
+
+    # Load model & optimizer
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    iteration = checkpoint["iteration"]
+
+    # Load replay buffer
+    if os.path.exists(BUFFER_PATH):
+        with open(BUFFER_PATH, "rb") as f:
+            buf_data = pickle.load(f)
+            buffer.load(buf_data["states"], buf_data["policies"], buf_data["values"])
+
+    # Load history
+    history = {"policy_loss": [], "value_loss": [], "game_length": []}
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH, "rb") as f:
+            history = pickle.load(f)
+
+    print(f"✅ Checkpoint loaded! Resuming from iteration {iteration}")
+    print(f"   Buffer size: {len(buffer)}")
+    return iteration, history
+
+#%% [markdown]
+# ## 7. Train!
 
 #%%
 def train():
@@ -464,10 +549,14 @@ def train():
     buffer = ReplayBuffer(MAX_BUFFER_SIZE)
     mcts_config = MCTSConfig(num_simulations=MCTS_SIMULATIONS)
 
-    # Training history
-    history = {"policy_loss": [], "value_loss": [], "game_length": []}
+    # Load checkpoint if exists
+    start_iteration, history = load_checkpoint(model, optimizer, scheduler, buffer)
 
-    for iteration in range(1, NUM_ITERATIONS + 1):
+    if start_iteration >= NUM_ITERATIONS:
+        print(f"Already completed {NUM_ITERATIONS} iterations!")
+        return model, history
+
+    for iteration in range(start_iteration + 1, NUM_ITERATIONS + 1):
         print(f"\n{'='*50}")
         print(f"Iteration {iteration}/{NUM_ITERATIONS}")
         print(f"{'='*50}")
@@ -497,6 +586,7 @@ def train():
 
         # Training
         if len(buffer) < BATCH_SIZE:
+            save_checkpoint(model, optimizer, scheduler, iteration, history, buffer)
             continue
 
         model.train()
@@ -533,57 +623,63 @@ def train():
 
         print(f"Policy loss: {avg_policy_loss:.4f}, Value loss: {avg_value_loss:.4f}")
 
+        # Save checkpoint after every iteration
+        save_checkpoint(model, optimizer, scheduler, iteration, history, buffer)
+
     return model, history
 
 
 # Run training
 print("Starting training...")
 trained_model, history = train()
-print("\nTraining complete!")
+print("\n🎉 Training complete!")
 
 #%%
 # Plot training curves
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+if len(history["policy_loss"]) > 0:
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-axes[0].plot(history["policy_loss"])
-axes[0].set_title("Policy Loss")
-axes[0].set_xlabel("Iteration")
-axes[0].set_ylabel("Loss")
+    axes[0].plot(history["policy_loss"])
+    axes[0].set_title("Policy Loss")
+    axes[0].set_xlabel("Iteration")
+    axes[0].set_ylabel("Loss")
 
-axes[1].plot(history["value_loss"])
-axes[1].set_title("Value Loss")
-axes[1].set_xlabel("Iteration")
-axes[1].set_ylabel("Loss")
+    axes[1].plot(history["value_loss"])
+    axes[1].set_title("Value Loss")
+    axes[1].set_xlabel("Iteration")
+    axes[1].set_ylabel("Loss")
 
-axes[2].plot(history["game_length"])
-axes[2].set_title("Average Game Length")
-axes[2].set_xlabel("Iteration")
-axes[2].set_ylabel("Moves")
+    axes[2].plot(history["game_length"])
+    axes[2].set_title("Average Game Length")
+    axes[2].set_xlabel("Iteration")
+    axes[2].set_ylabel("Moves")
 
-plt.tight_layout()
-plt.show()
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, "training_curves.png"))
+    plt.show()
+    print(f"Training curves saved to {SAVE_DIR}/training_curves.png")
 
 #%% [markdown]
-# ## 7. Save & Download Model
+# ## 8. Export Final Model
 
 #%%
-# Save model
+# Save final model for local use
+FINAL_MODEL_PATH = os.path.join(SAVE_DIR, "omok_model.pt")
 torch.save({
     "model_state_dict": trained_model.state_dict(),
     "history": history,
-}, "omok_model.pt")
-print("Model saved to omok_model.pt")
+}, FINAL_MODEL_PATH)
+print(f"Final model saved to {FINAL_MODEL_PATH}")
 
-# Download (Colab only)
+# Download option
 try:
     from google.colab import files
-    files.download("omok_model.pt")
-    print("Download started!")
-except ImportError:
-    print("Not running on Colab. Model saved locally.")
+    files.download(FINAL_MODEL_PATH)
+except:
+    pass
 
 #%% [markdown]
-# ## 8. Test the Model
+# ## 9. Test the Model
 
 #%%
 def test_model(model):

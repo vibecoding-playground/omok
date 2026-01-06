@@ -3,10 +3,25 @@
 #
 # AlphaZero 스타일 강화학습으로 9x9 오목 AI를 TPU에서 학습합니다.
 #
+# **특징:**
+# - Google Drive에 체크포인트 자동 저장
+# - 세션 종료 후에도 이어서 학습 가능
+#
 # **사용법:**
 # 1. 런타임 > 런타임 유형 변경 > **TPU** 선택
-# 2. 모든 셀 실행
-# 3. 학습 완료 후 모델 다운로드
+# 2. 모든 셀 실행 (기존 체크포인트가 있으면 자동으로 이어서 학습)
+
+#%% [markdown]
+# ## 0. Google Drive 마운트
+
+#%%
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+SAVE_DIR = '/content/drive/MyDrive/omok'
+os.makedirs(SAVE_DIR, exist_ok=True)
+print(f"Save directory: {SAVE_DIR}")
 
 #%%
 # Setup - Install JAX with TPU support
@@ -15,9 +30,8 @@ subprocess.run(["pip", "install", "-q", "jax[tpu]", "-f", "https://storage.googl
 subprocess.run(["pip", "install", "-q", "flax", "optax", "numpy", "tqdm", "matplotlib"])
 
 #%%
-import os
 import math
-import functools
+import pickle
 from enum import IntEnum
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Sequence
@@ -186,7 +200,7 @@ class PolicyValueNet(nn.Module):
         policy = nn.Conv(2, (1, 1), use_bias=False)(x)
         policy = nn.BatchNorm(use_running_average=not train)(policy)
         policy = nn.relu(policy)
-        policy = policy.reshape((policy.shape[0], -1))  # Flatten
+        policy = policy.reshape((policy.shape[0], -1))
         policy = nn.Dense(action_size)(policy)
         policy = nn.log_softmax(policy)
 
@@ -194,7 +208,7 @@ class PolicyValueNet(nn.Module):
         value = nn.Conv(1, (1, 1), use_bias=False)(x)
         value = nn.BatchNorm(use_running_average=not train)(value)
         value = nn.relu(value)
-        value = value.reshape((value.shape[0], -1))  # Flatten
+        value = value.reshape((value.shape[0], -1))
         value = nn.Dense(64)(value)
         value = nn.relu(value)
         value = nn.Dense(1)(value)
@@ -206,8 +220,6 @@ class PolicyValueNet(nn.Module):
 # Initialize model
 model = PolicyValueNet()
 rng = random.PRNGKey(42)
-
-# Create dummy input (batch, height, width, channels) - NHWC format for JAX
 dummy_input = jnp.ones((1, 9, 9, 2))
 variables = model.init(rng, dummy_input, train=False)
 
@@ -260,10 +272,8 @@ class MCTS:
         self.config = config
         self.root: Optional[Node] = None
 
-        # JIT compile the predict function
         @jit
         def predict_fn(params, batch_stats, state):
-            # state: (2, 9, 9) -> (1, 9, 9, 2) NHWC
             state = state.transpose(1, 2, 0)[None, ...]
             variables = {'params': params, 'batch_stats': batch_stats}
             (log_policy, value), _ = apply_fn(
@@ -306,7 +316,6 @@ class MCTS:
         policy, value = self.predict_fn(self.params, self.batch_stats, state)
         policy = np.array(policy)
 
-        # Mask invalid moves
         policy = policy * valid_moves
         policy_sum = policy.sum()
         if policy_sum > 0:
@@ -426,6 +435,14 @@ class ReplayBuffer:
             np.array([self.values[i] for i in indices]),
         )
 
+    def get_all(self) -> Tuple[List, List, List]:
+        return self.states, self.policies, self.values
+
+    def load(self, states, policies, values):
+        self.states = list(states)
+        self.policies = list(policies)
+        self.values = list(values)
+
     def __len__(self) -> int:
         return len(self.states)
 
@@ -437,7 +454,7 @@ print("Self-play system ready")
 
 #%%
 # Hyperparameters - TPU optimized
-NUM_ITERATIONS = 30
+NUM_ITERATIONS = 50
 GAMES_PER_ITERATION = 50
 MCTS_SIMULATIONS = 200
 BATCH_SIZE = 256  # Larger batch for TPU
@@ -445,13 +462,19 @@ EPOCHS_PER_ITERATION = 5
 LEARNING_RATE = 1e-3
 MAX_BUFFER_SIZE = 50000
 
+# Checkpoint paths
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint_jax.pkl")
+BUFFER_PATH = os.path.join(SAVE_DIR, "replay_buffer_jax.pkl")
+HISTORY_PATH = os.path.join(SAVE_DIR, "history_jax.pkl")
+
 print(f"Training config (TPU optimized):")
 print(f"  Iterations: {NUM_ITERATIONS}")
 print(f"  Games/iter: {GAMES_PER_ITERATION}")
 print(f"  Batch size: {BATCH_SIZE}")
+print(f"  Checkpoint: {CHECKPOINT_PATH}")
 
 #%% [markdown]
-# ## 6. Training Loop
+# ## 6. Training State & Checkpoints
 
 #%%
 class TrainState(train_state.TrainState):
@@ -463,7 +486,6 @@ def create_train_state(rng, model, learning_rate):
     dummy_input = jnp.ones((1, 9, 9, 2))
     variables = model.init(rng, dummy_input, train=True)
 
-    # Optimizer with gradient clipping
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate, weight_decay=1e-4),
@@ -477,6 +499,68 @@ def create_train_state(rng, model, learning_rate):
     )
 
 
+def save_checkpoint(state, iteration, history, buffer):
+    """Save training state to Google Drive."""
+    # Save model state
+    with open(CHECKPOINT_PATH, "wb") as f:
+        pickle.dump({
+            "iteration": iteration,
+            "params": state.params,
+            "batch_stats": state.batch_stats,
+            "opt_state": state.opt_state,
+        }, f)
+
+    # Save replay buffer
+    states, policies, values = buffer.get_all()
+    with open(BUFFER_PATH, "wb") as f:
+        pickle.dump({"states": states, "policies": policies, "values": values}, f)
+
+    # Save history
+    with open(HISTORY_PATH, "wb") as f:
+        pickle.dump(history, f)
+
+    print(f"  💾 Checkpoint saved (iteration {iteration})")
+
+
+def load_checkpoint(model, buffer):
+    """Load training state from Google Drive if exists."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        print("No checkpoint found. Starting fresh.")
+        rng = random.PRNGKey(42)
+        state = create_train_state(rng, model, LEARNING_RATE)
+        return state, 0, {"policy_loss": [], "value_loss": [], "game_length": []}
+
+    # Load model state
+    with open(CHECKPOINT_PATH, "rb") as f:
+        ckpt = pickle.load(f)
+
+    # Recreate state with loaded params
+    rng = random.PRNGKey(42)
+    state = create_train_state(rng, model, LEARNING_RATE)
+    state = state.replace(
+        params=ckpt["params"],
+        batch_stats=ckpt["batch_stats"],
+        opt_state=ckpt["opt_state"],
+    )
+    iteration = ckpt["iteration"]
+
+    # Load replay buffer
+    if os.path.exists(BUFFER_PATH):
+        with open(BUFFER_PATH, "rb") as f:
+            buf_data = pickle.load(f)
+            buffer.load(buf_data["states"], buf_data["policies"], buf_data["values"])
+
+    # Load history
+    history = {"policy_loss": [], "value_loss": [], "game_length": []}
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH, "rb") as f:
+            history = pickle.load(f)
+
+    print(f"✅ Checkpoint loaded! Resuming from iteration {iteration}")
+    print(f"   Buffer size: {len(buffer)}")
+    return state, iteration, history
+
+
 @jit
 def train_step(state: TrainState, batch_states, batch_policies, batch_values):
     """Single training step - JIT compiled."""
@@ -487,12 +571,8 @@ def train_step(state: TrainState, batch_states, batch_policies, batch_values):
             variables, batch_states, train=True, mutable=['batch_stats']
         )
 
-        # Policy loss: cross-entropy
         policy_loss = -jnp.sum(batch_policies * log_policy) / log_policy.shape[0]
-
-        # Value loss: MSE
         value_loss = jnp.mean((value.squeeze() - batch_values) ** 2)
-
         total_loss = policy_loss + value_loss
         return total_loss, (policy_loss, value_loss, updates)
 
@@ -504,18 +584,23 @@ def train_step(state: TrainState, batch_states, batch_policies, batch_values):
 
     return state, policy_loss, value_loss
 
+#%% [markdown]
+# ## 7. Train!
 
+#%%
 def train():
-    rng = random.PRNGKey(42)
     model = PolicyValueNet()
-    state = create_train_state(rng, model, LEARNING_RATE)
-
-    mcts_config = MCTSConfig(num_simulations=MCTS_SIMULATIONS)
     buffer = ReplayBuffer(MAX_BUFFER_SIZE)
+    mcts_config = MCTSConfig(num_simulations=MCTS_SIMULATIONS)
 
-    history = {"policy_loss": [], "value_loss": [], "game_length": []}
+    # Load checkpoint if exists
+    state, start_iteration, history = load_checkpoint(model, buffer)
 
-    for iteration in range(1, NUM_ITERATIONS + 1):
+    if start_iteration >= NUM_ITERATIONS:
+        print(f"Already completed {NUM_ITERATIONS} iterations!")
+        return state, history
+
+    for iteration in range(start_iteration + 1, NUM_ITERATIONS + 1):
         print(f"\n{'='*50}")
         print(f"Iteration {iteration}/{NUM_ITERATIONS}")
         print(f"{'='*50}")
@@ -546,6 +631,7 @@ def train():
 
         # Training
         if len(buffer) < BATCH_SIZE:
+            save_checkpoint(state, iteration, history, buffer)
             continue
 
         total_policy_loss, total_value_loss, num_batches = 0.0, 0.0, 0
@@ -574,61 +660,64 @@ def train():
 
         print(f"Policy loss: {avg_policy_loss:.4f}, Value loss: {avg_value_loss:.4f}")
 
+        # Save checkpoint after every iteration
+        save_checkpoint(state, iteration, history, buffer)
+
     return state, history
 
 
 # Run training
 print("Starting training on TPU...")
 trained_state, history = train()
-print("\nTraining complete!")
+print("\n🎉 Training complete!")
 
 #%%
 # Plot training curves
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+if len(history["policy_loss"]) > 0:
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-axes[0].plot(history["policy_loss"])
-axes[0].set_title("Policy Loss")
-axes[0].set_xlabel("Iteration")
+    axes[0].plot(history["policy_loss"])
+    axes[0].set_title("Policy Loss")
+    axes[0].set_xlabel("Iteration")
 
-axes[1].plot(history["value_loss"])
-axes[1].set_title("Value Loss")
-axes[1].set_xlabel("Iteration")
+    axes[1].plot(history["value_loss"])
+    axes[1].set_title("Value Loss")
+    axes[1].set_xlabel("Iteration")
 
-axes[2].plot(history["game_length"])
-axes[2].set_title("Avg Game Length")
-axes[2].set_xlabel("Iteration")
+    axes[2].plot(history["game_length"])
+    axes[2].set_title("Avg Game Length")
+    axes[2].set_xlabel("Iteration")
 
-plt.tight_layout()
-plt.show()
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, "training_curves_jax.png"))
+    plt.show()
+    print(f"Training curves saved to {SAVE_DIR}/training_curves_jax.png")
 
 #%% [markdown]
-# ## 7. Save & Download Model
+# ## 8. Export Final Model
 
 #%%
-import pickle
-
-# Save as pickle (JAX-native format)
+# Save final model
+FINAL_MODEL_PATH = os.path.join(SAVE_DIR, "omok_model_jax.pkl")
 model_data = {
     "params": trained_state.params,
     "batch_stats": trained_state.batch_stats,
     "history": history,
 }
 
-with open("omok_model_jax.pkl", "wb") as f:
+with open(FINAL_MODEL_PATH, "wb") as f:
     pickle.dump(model_data, f)
+print(f"Final model saved to {FINAL_MODEL_PATH}")
 
-print("Model saved to omok_model_jax.pkl")
-
-# Download
+# Download option
 try:
     from google.colab import files
-    files.download("omok_model_jax.pkl")
-    print("Download started!")
-except ImportError:
-    print("Not on Colab - model saved locally")
+    files.download(FINAL_MODEL_PATH)
+except:
+    pass
 
 #%% [markdown]
-# ## 8. Test the Model
+# ## 9. Test the Model
 
 #%%
 def test_model(state):
