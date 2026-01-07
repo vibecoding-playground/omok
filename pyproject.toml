@@ -10,6 +10,10 @@ dependencies = [
     "tqdm",
 ]
 
+[tool.setuptools]
+# 설치할 패키지 폴더들을 직접 지정합니다.
+packages = ["game", "mcts", "model", "training"]
+
 [project.optional-dependencies]
 jax = [
     "jax",
