@@ -661,9 +661,9 @@ def train():
         all_samples = []
         for game in games:
             samples = game.get_training_samples()
-            for state, policy, value in samples:
+            for board_state, policy, value in samples:
                 # Apply 8-way augmentation (rotations + flips)
-                augmented = augment_sample(state, policy)
+                augmented = augment_sample(board_state, policy)
                 for aug_state, aug_policy in augmented:
                     all_samples.append((aug_state, aug_policy, value))
 
