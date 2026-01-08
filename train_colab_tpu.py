@@ -388,6 +388,49 @@ class GameRecord:
         return samples
 
 
+def augment_sample(state: np.ndarray, policy: np.ndarray, board_size: int = 9):
+    """
+    Generate 8 symmetric augmentations of (state, policy) pair.
+
+    Transformations:
+    - 4 rotations (0°, 90°, 180°, 270°)
+    - 2 flips (original, horizontal flip)
+    = 8 total augmentations
+
+    Args:
+        state: (2, 9, 9) board state
+        policy: (81,) action probabilities
+        board_size: board dimension (default 9)
+
+    Returns:
+        List of 8 (state, policy) tuples
+    """
+    augmented = []
+    policy_2d = policy.reshape(board_size, board_size)
+
+    for flip in [False, True]:
+        state_aug = state.copy()
+        policy_aug = policy_2d.copy()
+
+        # Horizontal flip
+        if flip:
+            state_aug = np.flip(state_aug, axis=2)  # (2, 9, 9) -> flip along width
+            policy_aug = np.flip(policy_aug, axis=1)  # (9, 9) -> flip along width
+
+        # 4 rotations (0°, 90°, 180°, 270°)
+        for k in range(4):
+            # Rotate state: (2, 9, 9)
+            state_rot = np.rot90(state_aug, k=k, axes=(1, 2))
+            # Rotate policy: (9, 9)
+            policy_rot = np.rot90(policy_aug, k=k, axes=(0, 1))
+            # Flatten policy back to (81,)
+            policy_flat = policy_rot.flatten()
+
+            augmented.append((state_rot, policy_flat))
+
+    return augmented
+
+
 class SelfPlayWorker:
     def __init__(self, apply_fn, params, batch_stats, mcts_config: MCTSConfig):
         self.apply_fn = apply_fn
@@ -615,10 +658,15 @@ def train():
             game = worker.play_game()
             games.append(game)
 
-        # Collect samples
+        # Collect samples with 8x augmentation
         all_samples = []
         for game in games:
-            all_samples.extend(game.get_training_samples())
+            samples = game.get_training_samples()
+            for state, policy, value in samples:
+                # Apply 8-way augmentation (rotations + flips)
+                augmented = augment_sample(state, policy)
+                for aug_state, aug_policy in augmented:
+                    all_samples.append((aug_state, aug_policy, value))
 
         states = np.array([s[0] for s in all_samples], dtype=np.float32)
         policies = np.array([s[1] for s in all_samples], dtype=np.float32)
@@ -627,7 +675,10 @@ def train():
 
         avg_length = np.mean([len(g.states) for g in games])
         history["game_length"].append(avg_length)
-        print(f"Avg game length: {avg_length:.1f}, Buffer: {len(buffer)}")
+        num_raw_samples = sum(len(g.states) for g in games)
+        num_aug_samples = len(all_samples)
+        print(f"Avg game length: {avg_length:.1f}")
+        print(f"Samples: {num_raw_samples} raw → {num_aug_samples} augmented (8x), Buffer: {len(buffer)}")
 
         # Training
         if len(buffer) < BATCH_SIZE:
