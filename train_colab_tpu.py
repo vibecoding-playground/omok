@@ -604,12 +604,11 @@ def load_checkpoint(model, buffer):
     return state, iteration, history
 
 
-@jit
 def train_step(state: TrainState, batch_states, batch_policies, batch_values):
-    """Single training step - JIT compiled."""
+    """Single training step."""
 
-    def loss_fn(params, batch_stats):
-        variables = {'params': params, 'batch_stats': batch_stats}
+    def loss_fn(params):
+        variables = {'params': params, 'batch_stats': state.batch_stats}
         (log_policy, value), updates = state.apply_fn(
             variables, batch_states, train=True, mutable=['batch_stats']
         )
@@ -620,7 +619,7 @@ def train_step(state: TrainState, batch_states, batch_policies, batch_values):
         return total_loss, (policy_loss, value_loss, updates)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (policy_loss, value_loss, updates)), grads = grad_fn(state.params, state.batch_stats)
+    (loss, (policy_loss, value_loss, updates)), grads = grad_fn(state.params)
 
     state = state.apply_gradients(grads=grads)
     state = state.replace(batch_stats=updates['batch_stats'])
